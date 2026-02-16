@@ -1,0 +1,1 @@
+# DeepONet_Residual_Grobal_Standardization
