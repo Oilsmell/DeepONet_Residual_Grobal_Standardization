@@ -1,0 +1,129 @@
+# -*- coding: utf-8 -*-
+"""
+[Step 1 - Fixed] Train Autoencoder with Scaling
+Fix: Added StandardScaler to normalize data before training.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+import pickle # 스케일러 저장용
+from sklearn.preprocessing import StandardScaler
+
+# --- 설정 ---
+PATH_STRUCT_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1\fh_accelerations.dat"
+PATH_STRUCT_B = r"E:\2ndstructuredata\raw data\healthyclean.txt"
+SAVE_DIR = r"E:\2ndstructuredata\Code"
+ENCODER_SAVE_NAME = "autoencoder_encoder.pth"
+SCALER_SAVE_NAME = "autoencoder_scaler.pkl" # 스케일러 저장 이름
+
+WINDOW_SIZE = 128
+LATENT_DIM = 8
+BATCH_SIZE = 1024
+EPOCHS = 200
+LR = 0.001
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- 모델 ---
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim=128, latent_dim=8):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.Tanh(),
+            nn.Linear(64, 32), nn.Tanh(),
+            nn.Linear(32, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 32), nn.Tanh(),
+            nn.Linear(32, 64), nn.Tanh(),
+            nn.Linear(64, input_dim)
+        )
+    def forward(self, x):
+        z = self.encoder(x)
+        x_recon = self.decoder(z)
+        return x_recon, z
+
+# --- 데이터 로드 ---
+def load_data_A(filepath):
+    SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+    try:
+        data = np.loadtxt(filepath)[:, SELECTED_NODES]
+        n_points = data.shape[0]
+        n_samples = n_points // WINDOW_SIZE
+        data = data[:n_samples*WINDOW_SIZE, :]
+        reshaped = data.reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+        return reshaped.astype(np.float32)
+    except Exception as e:
+        print(f"Error loading A: {e}")
+        return None
+
+def load_data_B(filepath):
+    try:
+        raw = []
+        with open(filepath, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2: raw.append(float(parts[1]))
+        data = np.array(raw, dtype=np.float32)
+        reshaped = data.reshape(8, -1).T
+        n_samples = reshaped.shape[0] // WINDOW_SIZE
+        reshaped = reshaped[:n_samples*WINDOW_SIZE, :]
+        final_data = reshaped.reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+        return final_data
+    except Exception as e:
+        print(f"Error loading B: {e}")
+        return None
+
+def main():
+    if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
+
+    print("[1] Loading Data...")
+    data_a = load_data_A(PATH_STRUCT_A)
+    data_b = load_data_B(PATH_STRUCT_B)
+    
+    if data_a is None or data_b is None: return
+
+    # 합치기
+    combined_data = np.concatenate([data_a, data_b], axis=0)
+    print(f"   Total samples: {combined_data.shape[0]}")
+
+    # [수정] 스케일링 적용 (중요!)
+    print("[2] Scaling Data...")
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(combined_data) # 정규화 수행
+    
+    # 스케일러 저장 (Step 2에서 쓰기 위해)
+    with open(os.path.join(SAVE_DIR, SCALER_SAVE_NAME), 'wb') as f:
+        pickle.dump(scaler, f)
+    print("   Scaler saved.")
+
+    dataset = TensorDataset(torch.FloatTensor(scaled_data))
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    print("\n[3] Training Autoencoder...")
+    model = Autoencoder(input_dim=WINDOW_SIZE, latent_dim=LATENT_DIM).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    criterion = nn.MSELoss()
+
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        for batch in loader:
+            x = batch[0].to(device)
+            optimizer.zero_grad()
+            recon, _ = model(x)
+            loss = criterion(recon, x)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        if (epoch+1) % 20 == 0:
+            print(f"   Epoch {epoch+1}/{EPOCHS} | MSE Loss: {total_loss/len(loader):.6f}")
+
+    # 인코더 저장
+    torch.save(model.encoder.state_dict(), os.path.join(SAVE_DIR, ENCODER_SAVE_NAME))
+    print(f"\n✅ Encoder Saved.")
+
+if __name__ == "__main__":
+    main()
