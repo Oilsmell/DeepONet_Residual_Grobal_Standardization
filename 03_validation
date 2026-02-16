@@ -1,14 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-[Step 3 - Final Fixed] Inference & Validation on Structure B (Residual Model)
-Fix: Adjusted TRAIN_LEN slicing to match Window Size (Shape Mismatch Solved)
+Created on Mon Feb 16 16:05:21 2026
+
+@author: Oilsmell
 """
+
+# -*- coding: utf-8 -*-
+"""
+[Step 4 - Full Validation] DI Trend & Waveform/PSD Analysis
+Features:
+    1. Calculate & Compare DI for ALL cases (Structure A & B).
+    2. Normalize DI (MinMax based on A) for input/visualization.
+    3. Generate Damage Data using the trained DeepONet.
+    4. Visual Comparison: Time Domain (1000 pts) & Frequency Domain (PSD).
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
 import os
 import pickle
 from scipy.stats import kurtosis, pearsonr
+from scipy.signal import welch
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
@@ -17,9 +30,8 @@ import matplotlib.pyplot as plt
 # 1. 설정 (Configuration)
 # =========================================================
 DATA_DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
-HEALTHY_PATH_B = r"E:\2ndstructuredata\raw data\healthyclean.txt"
-DAMAGE_PATH_B  = r"E:\2ndstructuredata\raw data\D3_4_1.txt"  # 48% 손상 데이터
-#DAMAGE_PATH_B  = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1\f1_accerlerations.dat"  # 48% 손상 데이터
+DATA_DIR_B = r"E:\2ndstructuredata\raw data"  # B 데이터 폴더 경로
+HEALTHY_PATH_B = os.path.join(DATA_DIR_B, "healthyclean.txt")
 
 SAVE_DIR = r"E:\2ndstructuredata\Code"
 ENCODER_PATH = os.path.join(SAVE_DIR, "autoencoder_encoder.pth")
@@ -31,8 +43,13 @@ WINDOW_SIZE = 128
 LATENT_DIM = 8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Damage Cases
+CASES_A = [f"f{i}" for i in range(1, 11)]  # f1 ~ f10
+# B 데이터 파일명 규칙에 따라 수정 필요 (예: D1_4_1.txt ~ D1_48_1.txt)
+CASES_B = [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]
+
 # =========================================================
-# 2. 모델 정의 (학습 코드와 동일)
+# 2. 모델 정의
 # =========================================================
 def get_encoder_model(input_dim=128, latent_dim=8):
     return nn.Sequential(
@@ -74,193 +91,297 @@ class DeepONetResidual(nn.Module):
 # =========================================================
 # 3. 유틸리티 함수
 # =========================================================
-def calculate_di(healthy, damaged, fs=1000.0):
-    di_list = []
-    points_per_window = 2000
+def load_data_file(filepath, selected_nodes=None):
+    """파일 로드 및 전처리 (Node 선택 및 구조물 B 포맷 자동 감지)"""
+    if not os.path.exists(filepath):
+        print(f"File not found: {filepath}")
+        return None
     
+    try:
+        # 일단 np.loadtxt로 시도
+        data = np.loadtxt(filepath)
+        
+        # [Case A] 구조물 A: selected_nodes가 있고 컬럼이 많은 경우
+        if selected_nodes is not None:
+            if data.shape[1] >= max(selected_nodes): 
+                return data[:, selected_nodes].astype(np.float32)
+        
+        # [Case B] 구조물 B: 컬럼이 2개(Index, Value)인 경우 -> 값만 추출해서 Reshape
+        if data.ndim == 2 and data.shape[1] == 2:
+            # 2번째 컬럼(Value)만 가져옴
+            raw_values = data[:, 1]
+            # 구조물 B는 데이터를 8개 센서로 나누어야 함 (8, N) -> (N, 8)
+            # 데이터가 [센서1전체, 센서2전체, ...] 순서로 되어 있다고 가정 시:
+            return raw_values.reshape(8, -1).T.astype(np.float32)
+
+        # 그 외의 경우 (이미 전처리된 데이터 등)
+        return data.astype(np.float32)
+        
+    except Exception:
+        # np.loadtxt 실패 시 (구조물 B의 복잡한 포맷 등) 기존 파싱 로직 사용
+        raw = []
+        with open(filepath, 'r') as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 2: raw.append(float(p[1]))
+        # (8, -1) -> Transpose -> (N, 8)
+        data = np.array(raw, dtype=np.float32).reshape(8, -1).T
+        return data
+
+def calculate_single_di(healthy, damaged):
+    """단일 케이스 DI 계산"""
+    points = 2000
+    n = min(len(healthy), len(damaged)) // points
+    if n == 0: return 0.0
+    
+    di_vals = []
     for s in range(8):
-        h_sig = healthy[:, s]
-        d_sig = damaged[:, s]
-        n = len(h_sig) // points_per_window
-        if n == 0: continue
-        
-        k_h = kurtosis(h_sig[:n*points_per_window].reshape(n, points_per_window), axis=1, fisher=False)
-        k_d = kurtosis(d_sig[:n*points_per_window].reshape(n, points_per_window), axis=1, fisher=False)
-        
-        diff = abs(np.percentile(k_h, 95) - np.percentile(k_d, 95))
-        di_list.append(diff)
-        
-    return np.mean(di_list)
+        h = healthy[:n*points, s].reshape(n, points)
+        d = damaged[:n*points, s].reshape(n, points)
+        k_h = kurtosis(h, axis=1, fisher=False)
+        k_d = kurtosis(d, axis=1, fisher=False)
+        di_vals.append(abs(np.percentile(k_h, 95) - np.percentile(k_d, 95)))
+    return np.mean(di_vals)
 
-def load_structure_b(filepath):
-    raw = []
-    if not os.path.exists(filepath): return None
-    with open(filepath, 'r') as f:
-        for line in f:
-            p = line.split()
-            if len(p)>=2: raw.append(float(p[1]))
-    data = np.array(raw, dtype=np.float32).reshape(8, -1).T
-    return data
-
-# =========================================================
-# 4. 스케일러 재구축 (수정된 부분)
-# =========================================================
-def fit_scalers_on_A(encoder, ae_scaler):
-    print("   -> Re-fitting scalers using Structure A subset...")
+def generate_damage(encoder, deeponet, ae_scaler, scalers, healthy_data, target_di):
+    """DeepONet을 이용한 손상 데이터 생성"""
+    scaler_b, scaler_t, scaler_r = scalers
     
-    h_path = os.path.join(DATA_DIR_A, "fh_accelerations.dat")
-    raw_h = np.loadtxt(h_path)[:, SELECTED_NODES].astype(np.float32)
+    n_samples = len(healthy_data) // WINDOW_SIZE
+    valid_len = n_samples * WINDOW_SIZE
+    healthy_data = healthy_data[:valid_len, :]
     
-    d_path = os.path.join(DATA_DIR_A, "f1_accelerations.dat")
-    raw_d = np.loadtxt(d_path)[:, SELECTED_NODES].astype(np.float32)
-    
-    TRAIN_LEN = 20000 
-    n_samples = TRAIN_LEN // WINDOW_SIZE
-    valid_len = n_samples * WINDOW_SIZE # [핵심 수정] 128로 나누어 떨어지는 길이 계산 (19968)
-    
-    # [핵심 수정] valid_len까지만 슬라이싱
-    u_wins = raw_h[:valid_len, :].reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
-    d_wins = raw_d[:valid_len, :].reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
-    
+    # 1. Prepare Branch Input (Healthy Latent)
+    u_wins = healthy_data.reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
     u_scaled = ae_scaler.transform(u_wins)
-    encoder.eval()
+    
     with torch.no_grad():
         z_np = encoder(torch.FloatTensor(u_scaled).to(device)).cpu().numpy()
         
-    res = d_wins - u_wins
+    # 2. Add DI to Branch
+    di_vec = np.full((z_np.shape[0], 1), target_di)
+    branch_in = np.hstack([z_np, di_vec])
+    branch_expanded = np.repeat(branch_in, WINDOW_SIZE, axis=0)
     
-    di_mock = np.zeros((z_np.shape[0], 1))
-    branch_in = np.hstack([z_np, di_mock])
-    branch_in = np.repeat(branch_in, WINDOW_SIZE, axis=0)
-    
+    # 3. Prepare Trunk Input
     t_base = np.arange(WINDOW_SIZE)
     s_ids = np.tile(np.arange(8), n_samples)
     t_long = np.tile(t_base, len(s_ids))
     s_long = np.repeat(s_ids, WINDOW_SIZE)
     trunk_in = np.stack([t_long, s_long], axis=1)
     
-    scaler_b = StandardScaler().fit(branch_in)
-    scaler_t = MinMaxScaler().fit(trunk_in)
-    scaler_r = StandardScaler().fit(res.reshape(-1, 1))
+    # 4. Scale Inputs
+    branch_scaled = scaler_b.transform(branch_expanded)
+    trunk_scaled = scaler_t.transform(trunk_in)
     
-    return scaler_b, scaler_t, scaler_r
+    # 5. Predict Residual
+    batch_size = 50000
+    preds = []
+    deeponet.eval()
+    with torch.no_grad():
+        for i in range(0, len(branch_scaled), batch_size):
+            b_batch = torch.FloatTensor(branch_scaled[i:i+batch_size]).to(device)
+            t_batch = torch.FloatTensor(trunk_scaled[i:i+batch_size]).to(device)
+            out = deeponet(b_batch, t_batch)
+            preds.append(out.cpu().numpy())
+            
+    pred_res_scaled = np.concatenate(preds)
+    pred_res = scaler_r.inverse_transform(pred_res_scaled.reshape(-1, 1)).flatten()
+    
+    # 6. Construct Final Signal
+    # Note: Training was on Raw DI, so prediction matches Raw DI scale.
+    # No extra calibration applied here to show raw model performance.
+    generated_flat = u_wins.flatten() + pred_res
+    
+    gen_reshaped = generated_flat.reshape(n_samples, 8, WINDOW_SIZE).transpose(0, 2, 1).reshape(-1, 8)
+    return gen_reshaped
+
+def fit_training_scalers(encoder, ae_scaler):
+    """학습 때와 동일한 스케일러 피팅 (A 데이터 기준)"""
+    h_path = os.path.join(DATA_DIR_A, "fh_accelerations.dat")
+    raw_h = load_data_file(h_path, SELECTED_NODES)
+    d_path = os.path.join(DATA_DIR_A, "f1_accelerations.dat")
+    raw_d = load_data_file(d_path, SELECTED_NODES)
+    
+    TRAIN_LEN = 20000
+    n = TRAIN_LEN // WINDOW_SIZE
+    valid = n * WINDOW_SIZE
+    
+    u_wins = raw_h[:valid].reshape(n, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+    d_wins = raw_d[:valid].reshape(n, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+    u_scaled = ae_scaler.transform(u_wins)
+    
+    with torch.no_grad():
+        z = encoder(torch.FloatTensor(u_scaled).to(device)).cpu().numpy()
+        
+    # Dummy fit
+    res = d_wins - u_wins
+    di_mock = np.zeros((z.shape[0], 1))
+    branch_in = np.repeat(np.hstack([z, di_mock]), WINDOW_SIZE, axis=0)
+    
+    t_base = np.arange(WINDOW_SIZE)
+    trunk_in = np.stack([np.tile(t_base, len(z)*8), np.repeat(np.tile(np.arange(8), len(z)), WINDOW_SIZE)], axis=1)
+    
+    return StandardScaler().fit(branch_in), MinMaxScaler().fit(trunk_in), StandardScaler().fit(res.reshape(-1, 1))
 
 # =========================================================
-# 5. 메인 실행 함수
+# 4. 메인 실행
 # =========================================================
 def main():
-    print("[1] Loading Models & Tools...")
-    
-    with open(SCALER_PATH, 'rb') as f:
-        ae_scaler = pickle.load(f)
-        
+    print("[1] Loading Models...")
+    with open(SCALER_PATH, 'rb') as f: ae_scaler = pickle.load(f)
     encoder = get_encoder_model(latent_dim=LATENT_DIM).to(device)
     encoder.load_state_dict(torch.load(ENCODER_PATH))
     encoder.eval()
-    
     deeponet = DeepONetResidual(branch_dim=9, trunk_dim=2).to(device)
     deeponet.load_state_dict(torch.load(DEEPONET_PATH))
     deeponet.eval()
     
-    scaler_b, scaler_t, scaler_r = fit_scalers_on_A(encoder, ae_scaler)
-    print("   -> Scalers ready.")
-
-    print("\n[2] Loading Structure B Data...")
-    data_healthy = load_structure_b(HEALTHY_PATH_B)
-    data_real_damage = load_structure_b(DAMAGE_PATH_B)
+    scalers = fit_training_scalers(encoder, ae_scaler)
     
-    if data_healthy is None or data_real_damage is None:
-        print("❌ Data load failed.")
-        return
-
-    min_len = min(len(data_healthy), len(data_real_damage))
-    n_samples = min_len // WINDOW_SIZE
-    valid_len = n_samples * WINDOW_SIZE
+    # --- Data Loading ---
+    print("[2] Loading Healthy Data...")
+    data_h_A = load_data_file(os.path.join(DATA_DIR_A, "fh_accelerations.dat"), SELECTED_NODES)
+    data_h_B = load_data_file(HEALTHY_PATH_B)
     
-    data_healthy = data_healthy[:valid_len, :]
-    data_real_damage = data_real_damage[:valid_len, :]
-
-    print("\n[3] Calculating Target DI (Ground Truth)...")
-    target_di = calculate_di(data_healthy, data_real_damage)
-    print(f"   🎯 Target DI (from Real Data): {target_di:.6f}")
+    # --- Part 1: DI Calculation & Comparison ---
+    print("\n[3] Calculating DIs for All Cases...")
     
-    print("\n[4] Generating Synthetic Damage (Residual Method)...")
+    di_results_A = []
+    di_results_B = []
     
-    b_wins = data_healthy.reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
-    b_wins_scaled = ae_scaler.transform(b_wins)
-    
-    with torch.no_grad():
-        z_b = encoder(torch.FloatTensor(b_wins_scaled).to(device)).cpu().numpy()
+    # Structure A
+    print("   -> Processing Structure A...")
+    for case in CASES_A:
+        path = os.path.join(DATA_DIR_A, f"{case}_accelerations.dat")
+        data_d = load_data_file(path, SELECTED_NODES)
+        real_di = calculate_single_di(data_h_A, data_d)
+        di_results_A.append(real_di)
         
-    di_vec = np.full((z_b.shape[0], 1), target_di)
-    branch_in = np.hstack([z_b, di_vec])
-    branch_expanded = np.repeat(branch_in, WINDOW_SIZE, axis=0)
-    
-    t_base = np.arange(WINDOW_SIZE)
-    s_ids = np.tile(np.arange(8), n_samples)
-    t_long = np.tile(t_base, len(s_ids))
-    s_long = np.repeat(s_ids, WINDOW_SIZE)
-    trunk_in = np.stack([t_long, s_long], axis=1)
-    
-    branch_scaled = scaler_b.transform(branch_expanded)
-    trunk_scaled = scaler_t.transform(trunk_in)
-    
-    print("   -> Predicting Residuals...")
-    preds = []
-    BATCH = 50000
-    with torch.no_grad():
-        for i in range(0, len(branch_scaled), BATCH):
-            bb = torch.FloatTensor(branch_scaled[i:i+BATCH]).to(device)
-            tt = torch.FloatTensor(trunk_scaled[i:i+BATCH]).to(device)
-            pp = deeponet(bb, tt)
-            preds.append(pp.cpu().numpy())
-            
-    pred_res_scaled = np.concatenate(preds)
-    pred_res = scaler_r.inverse_transform(pred_res_scaled.reshape(-1, 1)).flatten()\
+    # Structure B
+    print("   -> Processing Structure B...")
+    for case in CASES_B:
+        # 파일명 형식: D1_4_1.txt, D1_8_1.txt ...
+        path = os.path.join(DATA_DIR_B, f"D1_{case}_1.txt")
+        if not os.path.exists(path): # 혹시 파일명이 다르면 확인 필요
+             path = os.path.join(DATA_DIR_B, f"D{case}.txt") # 예시
         
-    # [수정 제안] 잔차의 스케일 보정 (Calibration)
-    # 구조물 A 기준 스케일러라 B에게는 너무 큽니다. 강제로 줄여봅니다.
-    # 0.004(Target) / 0.038(Gen) ≈ 0.1 정도 비율입니다.
-    CALIBRATION_FACTOR = 0.13  
-    pred_res = pred_res * CALIBRATION_FACTOR
+        data_d = load_data_file(path)
+        if data_d is not None:
+            real_di = calculate_single_di(data_h_B, data_d)
+            di_results_B.append(real_di)
+        else:
+            di_results_B.append(0.0)
+
+    # Normalize DIs (Global Scale: Fit on A)
+    max_di_A = max(di_results_A)
+    min_di_A = min(di_results_A)
+    max_di_B = max(di_results_B)
+    min_di_B = min(di_results_B)
     
-    healthy_flat = b_wins.flatten()
-    generated_damage_flat = healthy_flat + pred_res
     
-    gen_reshaped = generated_damage_flat.reshape(n_samples, 8, WINDOW_SIZE)
-    generated_continuous = gen_reshaped.transpose(0, 2, 1).reshape(-1, 8)
+    # MinMax Scaling (0 ~ 1 based on A)
+    norm_di_A = [(d - min_di_A)/max_di_A  for d in di_results_A]
+    norm_di_B = [(d - min_di_B)/max_di_B for d in di_results_B]
     
-    print("\n[5] Validation & Metrics...")
+    print("\n" + "="*60)
+    print(f"{'Structure':<10} | {'Case':<10} | {'Real DI':<12} | {'Norm DI (0-1)':<15} | {'Gen DI':<12}")
+    print("-" * 60)
     
-    gen_di = calculate_di(data_healthy, generated_continuous)
-    di_error = abs(target_di - gen_di) / target_di * 100
-    print(f"   🤖 Generated DI: {gen_di:.6f}")
-    print(f"   📊 DI Error: {di_error:.2f}%")
+    # Generate & Compare for A
+    gen_di_A = []
+    for i, case in enumerate(CASES_A):
+        # Input Real DI to Model
+        gen_data = generate_damage(encoder, deeponet, ae_scaler, scalers, data_h_A, di_results_A[i])
+        g_di = calculate_single_di(data_h_A, gen_data)
+        gen_di_A.append(g_di)
+        print(f"{'A':<10} | {case:<10} | {di_results_A[i]:.6f}     | {norm_di_A[i]:.6f}          | {g_di:.6f}")
+
+    print("-" * 60)
     
-    mse = mean_squared_error(data_real_damage, generated_continuous)
-    corr, _ = pearsonr(data_real_damage[:10000, 0], generated_continuous[:10000, 0])
-    print(f"   MSE: {mse:.6f}, Correlation (Sen 0): {corr:.4f}")
+    # Generate & Compare for B
+    gen_di_B = []
+    for i, case in enumerate(CASES_B):
+        # Input Real DI to Model
+        gen_data = generate_damage(encoder, deeponet, ae_scaler, scalers, data_h_B, di_results_B[i])
+        g_di = calculate_single_di(data_h_B, gen_data)
+        gen_di_B.append(g_di)
+        print(f"{'B':<10} | {case:<10} | {di_results_B[i]:.6f}     | {norm_di_B[i]:.6f}          | {g_di:.6f}")
     
-    SENSOR_IDX = 0
-    VIEW_POINTS = 1000
+    print("="*60)
     
-    real_plot = data_real_damage[:, SENSOR_IDX]
-    gen_plot = generated_continuous[:, SENSOR_IDX]
+    # ---------------------------------------------------------
+    # [Added] DI Trend Visualization (Real vs Generated)
+    # ---------------------------------------------------------
     
-    plt.figure(figsize=(15, 6))
-    plt.plot(real_plot[:VIEW_POINTS], 'b-', alpha=0.6, linewidth=1.0, label=f'Real Damage (DI={target_di:.4f})')
-    plt.plot(gen_plot[:VIEW_POINTS], 'r--', linewidth=1.5, label=f'Generated (Residual, DI={gen_di:.4f})')
-    plt.title(f"Validation Structure B (Residual Method)\nDI Error: {di_error:.2f}% | MSE: {mse:.4f}")
-    plt.xlabel("Time Points")
-    plt.ylabel("Acceleration")
-    plt.legend(loc='upper right')
+    # Structure A Graph
+    plt.figure(figsize=(10, 5))
+    plt.plot(CASES_A, di_results_A, 'k-o', linewidth=2, label='Real DI')
+    plt.plot(CASES_A, gen_di_A, 'r--s', linewidth=2, label='Generated DI')
+    plt.title("Structure A: Damage Index Trend Comparison")
+    plt.xlabel("Damage Case")
+    plt.ylabel("DI (Kurtosis Diff)")
+    plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    save_path = "structure_b_residual_validation.png"
-    plt.savefig(save_path)
-    print(f"\n✅ Graph Saved: {save_path}")
     plt.show()
+
+    # Structure B Graph
+    plt.figure(figsize=(10, 5))
+    # x축 레이블을 문자열로 변환하여 간격 일정하게 표시
+    x_labels_b = [str(c) for c in CASES_B] 
+    plt.plot(x_labels_b, di_results_B, 'k-o', linewidth=2, label='Real DI')
+    plt.plot(x_labels_b, gen_di_B, 'r--s', linewidth=2, label='Generated DI')
+    plt.title("Structure B: Damage Index Trend Comparison")
+    plt.xlabel("Damage Case (%)")
+    plt.ylabel("DI (Kurtosis Diff)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+    
+    # --- Part 2: Detailed Visualization (A-50%, B-48%) ---
+    print("\n[4] Visualizing Specific Cases (1000 samples)...")
+    
+    # Case A: 50% (f5)
+    idx_a = CASES_A.index("f5")
+    target_di_a = di_results_A[idx_a]
+    data_d_A_50 = load_data_file(os.path.join(DATA_DIR_A, "f5_accelerations.dat"), SELECTED_NODES)
+    gen_A_50 = generate_damage(encoder, deeponet, ae_scaler, scalers, data_h_A, target_di_a)
+    
+    # Case B: 48% (Case 48)
+    idx_b = CASES_B.index(48)
+    target_di_b = di_results_B[idx_b]
+    path_b_48 = os.path.join(DATA_DIR_B, f"D1_48_1.txt")
+    data_d_B_48 = load_data_file(path_b_48)
+    gen_B_48 = generate_damage(encoder, deeponet, ae_scaler, scalers, data_h_B, target_di_b)
+    
+    def plot_comparison(real, gen, title, samples=1000):
+        # Time Domain
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 1, 1)
+        plt.plot(real[:samples, 0], 'k-', label='Real Damage')
+        plt.plot(gen[:samples, 0], 'r--', label='Generated Damage')
+        plt.title(f"{title} - Time Domain (Sensor 1)")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        # Frequency Domain (PSD)
+        f_r, p_r = welch(real[:, 0], fs=100, nperseg=1024)
+        f_g, p_g = welch(gen[:, 0], fs=100, nperseg=1024)
+        
+        plt.subplot(2, 1, 2)
+        plt.semilogy(f_r, p_r, 'k-', label='Real PSD')
+        plt.semilogy(f_g, p_g, 'r--', label='Generated PSD')
+        plt.title(f"{title} - Frequency Domain")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("PSD")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+    plot_comparison(data_d_A_50, gen_A_50, "Structure A (50% Damage)")
+    plot_comparison(data_d_B_48, gen_B_48, "Structure B (48% Damage)")
 
 if __name__ == "__main__":
     main()
