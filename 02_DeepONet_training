@@ -1,0 +1,262 @@
+# -*- coding: utf-8 -*-
+"""
+[Step 2 - Final Fixed v4] Train DeepONet with Residual Learning
+Fix: Removed 'unsqueeze(1)' in forward to prevent memory explosion.
+"""
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+import pickle
+from scipy.stats import kurtosis
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import matplotlib.pyplot as plt
+
+# --- 설정 ---
+DATA_DIR_A = r"E:\Benchmark Code\benchmarktu1402-master\f_accerlerations\ds1"
+DATA_FILE_B = r"E:\2ndstructuredata\raw data\healthyclean.txt"
+SAVE_DIR = r"E:\2ndstructuredata\Code"
+ENCODER_PATH = os.path.join(SAVE_DIR, "autoencoder_encoder.pth")
+SCALER_PATH = os.path.join(SAVE_DIR, "autoencoder_scaler.pkl")
+DEEPONET_SAVE_NAME = "deeponet_residual_model.pth"
+
+SELECTED_NODES = [3, 21, 39, 57, 63, 81, 99, 117]
+WINDOW_SIZE = 128
+LATENT_DIM = 8
+BATCH_SIZE = 10240 
+EPOCHS = 300       
+LR = 0.001
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- 모델 정의 ---
+def get_encoder_model(input_dim=128, latent_dim=8):
+    return nn.Sequential(
+        nn.Linear(input_dim, 64), nn.Tanh(),
+        nn.Linear(64, 32), nn.Tanh(),
+        nn.Linear(32, latent_dim)
+    )
+
+class FourierFeature(nn.Module):
+    def __init__(self, input_dim, mapping_size=256, scale=15):
+        super().__init__()
+        self.register_buffer('B', torch.randn(input_dim, mapping_size) * scale)
+    def forward(self, x):
+        projected = 2 * np.pi * (x @ self.B)
+        return torch.cat([torch.sin(projected), torch.cos(projected)], dim=-1)
+
+class DeepONetResidual(nn.Module):
+    def __init__(self, branch_dim=9, trunk_dim=2, hidden_dim=256, output_dim=256):
+        super().__init__()
+        self.activation = nn.SiLU()
+        self.branch = nn.Sequential(
+            nn.Linear(branch_dim, hidden_dim), self.activation,
+            nn.Linear(hidden_dim, hidden_dim), self.activation,
+            nn.Linear(hidden_dim, output_dim)
+        )
+        self.fourier = FourierFeature(trunk_dim, mapping_size=256, scale=10.0)
+        self.trunk = nn.Sequential(
+            nn.Linear(512, hidden_dim), self.activation,
+            nn.Linear(hidden_dim, hidden_dim), self.activation,
+            nn.Linear(hidden_dim, output_dim)
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, branch_in, trunk_in):
+        B = self.branch(branch_in)
+        T = self.trunk(self.fourier(trunk_in))
+        # [수정됨] unsqueeze(1) 제거 -> Element-wise product
+        return torch.sum(B * T, dim=-1) + self.bias
+
+# --- 데이터 처리 함수 ---
+def load_and_process_A(encoder, ae_scaler):
+    print("[Data] Processing Structure A...")
+    h_path = os.path.join(DATA_DIR_A, "fh_accelerations.dat")
+    raw_h = np.loadtxt(h_path)[:, SELECTED_NODES].astype(np.float32)
+    
+    raw_d_list = []
+    for i in range(1, 11):
+        d_path = os.path.join(DATA_DIR_A, f"f{i}_accelerations.dat")
+        raw_d_list.append(np.loadtxt(d_path)[:, SELECTED_NODES].astype(np.float32))
+    
+    def get_kurt(sig):
+        points = len(sig)
+        n = points // 2000
+        if n==0: return 0
+        k = kurtosis(sig[:n*2000].reshape(n, 2000), axis=1, fisher=False)
+        return np.percentile(k, 95)
+
+    base_kurts = [get_kurt(raw_h[:, s]) for s in range(8)]
+    c_values = []
+    for d_data in raw_d_list:
+        diffs = [abs(base_kurts[s] - get_kurt(d_data[:, s])) for s in range(8)]
+        c_values.append(np.mean(diffs))
+    
+    TRAIN_LEN = 128000
+    n_samples = TRAIN_LEN // WINDOW_SIZE
+    
+    u_raw = raw_h[:TRAIN_LEN, :]
+    u_wins = u_raw.reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+    u_wins_scaled = ae_scaler.transform(u_wins)
+    
+    encoder.eval()
+    with torch.no_grad():
+        z_tensor = encoder(torch.FloatTensor(u_wins_scaled).to(device))
+    z_numpy = z_tensor.cpu().numpy() 
+    
+    t_base = np.arange(WINDOW_SIZE)
+    s_ids = np.tile(np.arange(8), n_samples)
+    t_long = np.tile(t_base, len(s_ids))
+    s_long = np.repeat(s_ids, WINDOW_SIZE)
+    trunk_base = np.stack([t_long, s_long], axis=1) 
+    
+    Z_train_list, Res_train_list = [], []
+    
+    for i, d_data in enumerate(raw_d_list):
+        d_raw = d_data[:TRAIN_LEN, :]
+        d_wins = d_raw.reshape(n_samples, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+        
+        residual = d_wins - u_wins
+        
+        curr_di = c_values[i]
+        di_vec = np.full((z_numpy.shape[0], 1), curr_di)
+        branch_in = np.hstack([z_numpy, di_vec]) 
+        
+        Z_train_list.append(branch_in)
+        Res_train_list.append(residual)
+    
+    Branch_concat = np.concatenate(Z_train_list, axis=0)
+    Branch_final = np.repeat(Branch_concat, WINDOW_SIZE, axis=0)
+    Trunk_final = np.tile(trunk_base, (10, 1))
+    Target_final = np.concatenate(Res_train_list, axis=0).flatten()
+    
+    return Branch_final, Trunk_final, Target_final
+
+def main():
+    if not os.path.exists(SAVE_DIR): os.makedirs(SAVE_DIR)
+
+    # 1. Load AE Tools
+    print("[1] Loading Encoder & Scaler...")
+    
+    with open(SCALER_PATH, 'rb') as f:
+        ae_scaler = pickle.load(f)
+    print("   Scaler loaded.")
+
+    encoder = get_encoder_model(latent_dim=LATENT_DIM).to(device)
+    try:
+        encoder.load_state_dict(torch.load(ENCODER_PATH))
+        print("   Encoder loaded successfully.")
+    except RuntimeError as e:
+        print(f"   ❌ Model mismatch error: {e}")
+        return
+    encoder.eval()
+
+    # 2. Prepare Data (A)
+    B_train, T_train, R_train = load_and_process_A(encoder, ae_scaler)
+    
+    scaler_b = StandardScaler()
+    scaler_t = MinMaxScaler()
+    scaler_r = StandardScaler()
+    
+    print("[2] Scaling Training Data...")
+    B_train = scaler_b.fit_transform(B_train)
+    T_train = scaler_t.fit_transform(T_train)
+    R_train = scaler_r.fit_transform(R_train.reshape(-1, 1)).flatten()
+    
+    dataset = TensorDataset(torch.FloatTensor(B_train), torch.FloatTensor(T_train), torch.FloatTensor(R_train))
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    # 3. Train
+    print("\n[3] Training DeepONet (Residual)...")
+    model = DeepONetResidual(branch_dim=9, trunk_dim=2).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    loss_fn = nn.MSELoss()
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        for b, t, r in loader:
+            b, t, r = b.to(device), t.to(device), r.to(device)
+            optimizer.zero_grad()
+            pred = model(b, t)
+            loss = loss_fn(pred, r)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        if (epoch+1) % 10 == 0:
+            print(f"   Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(loader):.6f}")
+            
+    torch.save(model.state_dict(), os.path.join(SAVE_DIR, DEEPONET_SAVE_NAME))
+    print("✅ DeepONet Saved.")
+
+    # 4. Inference Structure B
+    print("\n[4] Generating Structure B...")
+    
+    raw_b = []
+    with open(DATA_FILE_B, 'r') as f:
+        for line in f:
+            p = line.split()
+            if len(p)>=2: raw_b.append(float(p[1]))
+    data_b = np.array(raw_b, dtype=np.float32).reshape(8, -1).T
+    
+    n_samp_b = data_b.shape[0] // WINDOW_SIZE
+    data_b = data_b[:n_samp_b*WINDOW_SIZE, :]
+    
+    b_wins = data_b.reshape(n_samp_b, WINDOW_SIZE, 8).transpose(0, 2, 1).reshape(-1, WINDOW_SIZE)
+    b_wins_scaled = ae_scaler.transform(b_wins)
+    
+    with torch.no_grad():
+        z_b = encoder(torch.FloatTensor(b_wins_scaled).to(device)).cpu().numpy()
+        
+    TARGET_DI = 0.002
+    di_vec_b = np.full((z_b.shape[0], 1), TARGET_DI)
+    branch_in_b = np.hstack([z_b, di_vec_b])
+    
+    branch_in_expanded = np.repeat(branch_in_b, WINDOW_SIZE, axis=0)
+    
+    t_base = np.arange(WINDOW_SIZE)
+    s_ids_b = np.tile(np.arange(8), n_samp_b)
+    t_long_b = np.tile(t_base, len(s_ids_b))
+    s_long_b = np.repeat(s_ids_b, WINDOW_SIZE)
+    trunk_in_expanded = np.stack([t_long_b, s_long_b], axis=1)
+    
+    branch_in_scaled = scaler_b.transform(branch_in_expanded)
+    trunk_in_scaled = scaler_t.transform(trunk_in_expanded)
+    
+    model.eval()
+    with torch.no_grad():
+        preds = []
+        bs = 50000
+        for i in range(0, branch_in_scaled.shape[0], bs):
+            bb = torch.FloatTensor(branch_in_scaled[i:i+bs]).to(device)
+            tt = torch.FloatTensor(trunk_in_scaled[i:i+bs]).to(device)
+            pp = model(bb, tt)
+            preds.append(pp.cpu().numpy())
+    
+    pred_res_scaled = np.concatenate(preds)
+    pred_res = scaler_r.inverse_transform(pred_res_scaled.reshape(-1, 1)).flatten()
+    
+    b_healthy_flat = b_wins.flatten()
+    final_signal = b_healthy_flat + pred_res
+    
+    final_reshaped = final_signal.reshape(n_samp_b, 8, WINDOW_SIZE)
+    final_time_first = final_reshaped.transpose(0, 2, 1)
+    final_continuous = final_time_first.reshape(-1, 8)
+    
+    gen_long = final_continuous[:, 0]
+    org_long = data_b[:, 0]
+    
+    plt.figure(figsize=(15, 6))
+    VP = 5000
+    plt.plot(org_long[:VP], 'b-', alpha=0.5, label='Healthy B')
+    plt.plot(gen_long[:VP], 'r--', label=f'Gen (Residual, DI={TARGET_DI})')
+    plt.title("Structure B: Residual-Based Generation (Memory Fix)")
+    plt.legend()
+    plt.savefig("structure_b_residual_gen_final.png")
+    print("Graph Saved.")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
